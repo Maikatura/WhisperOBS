@@ -1,30 +1,35 @@
 ﻿using NAudio.Wave;
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace WhisperOBS.Audio;
 
 /// <summary>
 /// Captures microphone audio via NAudio, resamples to 16 kHz mono float32,
-/// and raises <see cref="AudioReady"/> every <see cref="ChunkSeconds"/> seconds.
+/// and handles high-frequency live visual updates alongside low-frequency transcription chunking.
 /// </summary>
 public sealed class MicrophoneCapture : IDisposable
 {
-    // Whisper expects 16 kHz mono float32
-    private const int SampleRate  = 16_000;
-    private const int Channels    = 1;
+    private const int SampleRate = 16_000;
+    private const int Channels   = 1;
 
-    /// <summary>How many seconds of audio to collect before transcribing.</summary>
     public double ChunkSeconds { get; set; } = 3.0;
 
     /// <summary>
-    /// Raised on a thread-pool thread with a complete audio chunk ready for transcription.
+    /// Raised on a thread-pool thread with a complete long audio chunk ready for transcription (e.g., every 3s).
     /// </summary>
     public event Func<float[], Task>? AudioReady;
 
-    private readonly int _deviceIndex;
-    private WaveInEvent?       _waveIn;
-    private WaveFormat?        _captureFormat;
+    /// <summary>
+    /// FAST PATH CRITICAL: Raised instantly every 100ms with processed float samples for fluid UI visualization.
+    /// </summary>
+    public event Action<float[]>? LiveBufferAvailable;
 
-    // Ring buffer accumulating raw bytes from the mic
+    private readonly int _deviceIndex;
+    private WaveInEvent? _waveIn;
+    private WaveFormat?  _captureFormat;
+
     private readonly List<byte> _rawBuffer = new();
     private readonly object     _bufLock   = new();
     private int _samplesPerChunk;
@@ -36,17 +41,12 @@ public sealed class MicrophoneCapture : IDisposable
 
     public void Start()
     {
-        var caps = WaveInEvent.GetCapabilities(_deviceIndex);
-
-        // Prefer 16 kHz mono if the device supports it, otherwise use 44.1 kHz stereo
-        // and resample during conversion.
         _captureFormat = new WaveFormat(SampleRate, 16, Channels);
 
-        // Some devices don't support 16 kHz; fall back to 44100 stereo
         try
         {
             _waveIn = CreateWaveIn(_captureFormat);
-            _waveIn.StartRecording(); // test – will throw if format unsupported
+            _waveIn.StartRecording();
         }
         catch
         {
@@ -56,8 +56,6 @@ public sealed class MicrophoneCapture : IDisposable
             _waveIn.StartRecording();
         }
 
-        // How many raw bytes equal one chunk?
-        int bytesPerSample = _captureFormat.BitsPerSample / 8;
         _samplesPerChunk = (int)(ChunkSeconds * _captureFormat.SampleRate * _captureFormat.Channels);
         Console.WriteLine($"[Mic] Capturing at {_captureFormat.SampleRate} Hz, " +
                           $"{_captureFormat.Channels}ch – chunk = {ChunkSeconds}s");
@@ -69,7 +67,7 @@ public sealed class MicrophoneCapture : IDisposable
         {
             DeviceNumber = _deviceIndex,
             WaveFormat   = format,
-            BufferMilliseconds = 100
+            BufferMilliseconds = 100 // Visuals get fed every 100ms
         };
         wi.DataAvailable    += OnDataAvailable;
         wi.RecordingStopped += (_, e) =>
@@ -82,21 +80,32 @@ public sealed class MicrophoneCapture : IDisposable
 
     private void OnDataAvailable(object? sender, WaveInEventArgs e)
     {
+        if (e.BytesRecorded == 0) return;
+
+        // ── 1. FAST PATH: Convert the immediate 100ms incoming buffer for visuals ──
+        byte[] immediateBuffer = new byte[e.BytesRecorded];
+        Buffer.BlockCopy(e.Buffer, 0, immediateBuffer, 0, e.BytesRecorded);
+
+        // Convert and broadcast immediately (Non-blocking)
+        _ = Task.Run(() =>
+        {
+            float[] livePcm = ConvertToWhisperPcm(immediateBuffer, _captureFormat!);
+            LiveBufferAvailable?.Invoke(livePcm);
+        });
+
+        // ── 2. SLOW PATH: Accumulate raw bytes into long transcription chunk ──
         lock (_bufLock)
         {
-            for (int i = 0; i < e.BytesRecorded; i++)
-                _rawBuffer.Add(e.Buffer[i]);
+            _rawBuffer.AddRange(immediateBuffer);
 
-            int bytesPerSample  = _captureFormat!.BitsPerSample / 8;
-            int bytesPerFrame   = bytesPerSample * _captureFormat.Channels;
-            int bytesNeeded     = _samplesPerChunk * bytesPerSample;
+            int bytesPerSample = _captureFormat!.BitsPerSample / 8;
+            int bytesNeeded    = _samplesPerChunk * bytesPerSample;
 
             if (_rawBuffer.Count >= bytesNeeded)
             {
                 byte[] chunk = _rawBuffer.GetRange(0, bytesNeeded).ToArray();
                 _rawBuffer.RemoveRange(0, bytesNeeded);
 
-                // Process off the hot path
                 _ = Task.Run(async () =>
                 {
                     float[] pcm = ConvertToWhisperPcm(chunk, _captureFormat);
@@ -107,25 +116,15 @@ public sealed class MicrophoneCapture : IDisposable
         }
     }
 
-    /// <summary>
-    /// Converts raw PCM bytes from the capture format to 16 kHz mono float32.
-    /// </summary>
     private static float[] ConvertToWhisperPcm(byte[] raw, WaveFormat srcFormat)
     {
-        // 1. Decode to float samples (handles 16-bit and 32-bit PCM)
         float[] srcSamples = Pcm16ToFloat(raw);
 
-        // 2. Down-mix to mono if needed
-        float[] mono = srcFormat.Channels == 1
-            ? srcSamples
-            : StereoToMono(srcSamples);
+        float[] mono = srcFormat.Channels == 1 ? srcSamples : StereoToMono(srcSamples);
 
-        // 3. Resample to 16 kHz if needed
-        float[] resampled = srcFormat.SampleRate == SampleRate
+        return srcFormat.SampleRate == SampleRate
             ? mono
             : Resample(mono, srcFormat.SampleRate, SampleRate);
-
-        return resampled;
     }
 
     private static float[] Pcm16ToFloat(byte[] raw)
@@ -145,7 +144,6 @@ public sealed class MicrophoneCapture : IDisposable
         return mono;
     }
 
-    /// <summary>Linear interpolation resampler – adequate quality for speech.</summary>
     private static float[] Resample(float[] src, int srcRate, int dstRate)
     {
         double ratio    = (double)srcRate / dstRate;
@@ -163,13 +161,6 @@ public sealed class MicrophoneCapture : IDisposable
         return dst;
     }
 
-    public void Stop()
-    {
-        _waveIn?.StopRecording();
-    }
-
-    public void Dispose()
-    {
-        _waveIn?.Dispose();
-    }
+    public void Stop() => _waveIn?.StopRecording();
+    public void Dispose() => _waveIn?.Dispose();
 }

@@ -11,34 +11,41 @@ public sealed class WhisperService : IDisposable
     private readonly string _modelPath;
     private readonly string _language;
 
-    private WhisperFactory?    _factory;
-    private WhisperProcessor?  _processor;
+    private WhisperFactory? _factory;
+    private WhisperProcessor? _processor;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public WhisperService(string modelPath, string language)
     {
         _modelPath = modelPath;
-        _language  = language;
+        _language = language;
     }
 
     public async Task InitAsync()
     {
         await Task.Run(() =>
         {
-            _factory = WhisperFactory.FromPath(_modelPath);
+            
+            _factory = WhisperFactory.FromPath(_modelPath, new WhisperFactoryOptions 
+            {
+                UseGpu = true,
+                GpuDevice = 0 
+            });
 
             var builder = _factory.CreateBuilder()
                 .WithThreads(Math.Max(1, Environment.ProcessorCount / 2))
-                .WithSingleSegment()          // emit one segment at a time
-                .WithNoContext()              // don't carry context between chunks
+                .WithSingleSegment()          
+                .WithNoContext()              
                 .WithTemperature(0f);
 
             if (_language != "auto")
                 builder = builder.WithLanguage(_language);
 
             _processor = builder.Build();
+            Console.WriteLine($"[Whisper] Engine initialized via: {WhisperFactory.GetRuntimeInfo()}");
         });
     }
+
 
     /// <summary>
     /// Transcribes a chunk of 16 kHz mono float32 PCM audio.
@@ -47,8 +54,6 @@ public sealed class WhisperService : IDisposable
     public async Task<string> TranscribeAsync(float[] samples)
     {
         if (_processor is null) return string.Empty;
-
-        // Whisper.net is not thread-safe; serialise calls.
         await _lock.WaitAsync();
         try
         {
@@ -57,11 +62,9 @@ public sealed class WhisperService : IDisposable
             await foreach (var segment in _processor.ProcessAsync(samples))
             {
                 var text = segment.Text.Trim();
-
-                // Filter out common hallucination artifacts
                 if (string.IsNullOrWhiteSpace(text)) continue;
-                if (text.StartsWith('[') && text.EndsWith(']')) continue; // e.g. [BLANK_AUDIO]
-                if (text.StartsWith('(') && text.EndsWith(')')) continue; // e.g. (music)
+                if (text.StartsWith('[') && text.EndsWith(']')) continue;
+                if (text.StartsWith('(') && text.EndsWith(')')) continue;
 
                 segments.Add(text);
             }

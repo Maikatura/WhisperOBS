@@ -7,7 +7,6 @@ namespace WhisperOBS.Models;
 /// </summary>
 public static class SetupWizard
 {
-    // Pre-defined Whisper model download URLs (gguf format for Whisper.net)
     private static readonly (string Label, string FileName, string Url)[] KnownModels =
     [
         ("Tiny   (~75 MB)  – fastest, least accurate",
@@ -34,14 +33,12 @@ public static class SetupWizard
     public static async Task<AppConfig> RunAsync()
     {
         var config = new AppConfig();
-
-        // ── Model selection ──────────────────────────────────────────────────
+        
         string modelsDir = Path.Combine(AppContext.BaseDirectory, "models");
         Directory.CreateDirectory(modelsDir);
 
         Console.WriteLine("── Whisper Model ──────────────────────────────────");
-
-        // Check which models are already downloaded
+        
         var downloaded = KnownModels
             .Select((m, i) => (m, i, path: Path.Combine(modelsDir, m.FileName)))
             .ToList();
@@ -92,8 +89,7 @@ public static class SetupWizard
                 await DownloadFileAsync(url, config.ModelPath);
             }
         }
-
-        // ── Language selection ───────────────────────────────────────────────
+        
         Console.WriteLine("── Language ───────────────────────────────────────");
         Console.WriteLine("Enter language code (e.g. en, sv, de, fr) or leave blank for auto-detect:");
         Console.Write("Language: ");
@@ -101,8 +97,7 @@ public static class SetupWizard
         if (string.IsNullOrWhiteSpace(config.Language))
             config.Language = "auto";
         Console.WriteLine();
-
-        // ── Microphone selection ─────────────────────────────────────────────
+        
         Console.WriteLine("── Microphone ─────────────────────────────────────");
         int deviceCount = WaveInEvent.DeviceCount;
         if (deviceCount == 0)
@@ -118,8 +113,7 @@ public static class SetupWizard
         string? micInput = Console.ReadLine()?.Trim();
         config.DeviceIndex = int.TryParse(micInput, out int micIdx) ? micIdx : 0;
         Console.WriteLine();
-
-        // ── Port ─────────────────────────────────────────────────────────────
+        
         Console.Write("HTTP port for OBS overlay (default 5000): ");
         string? portInput = Console.ReadLine()?.Trim();
         config.Port = int.TryParse(portInput, out int port) ? port : 5000;

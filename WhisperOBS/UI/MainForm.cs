@@ -2,35 +2,26 @@
 using WhisperOBS.Audio;
 using WhisperOBS.Models;
 using WhisperOBS.Server;
+using WhisperOBS.Services;
+using WhisperOBS.UI.Views;
 
 namespace WhisperOBS.UI;
 
 /// <summary>
-/// Main application window.  Entirely code-constructed — no .Designer.cs or .resx.
-///
-/// Layout:
-///   ┌─────────────────────────────────────────────────────┐
-///   │  Header bar  (logo + status pill)                   │
-///   ├──────────────┬──────────────────────────────────────┤
-///   │  Left panel  │  Right panel                         │
-///   │  ─ Model     │  ─ Waveform visualizer               │
-///   │  ─ Mic       │  ─ Caption log                       │
-///   │  ─ Language  │  ─ OBS URL bar                       │
-///   │  ─ Port      │                                      │
-///   │  ─ Chunk s   │                                      │
-///   │  ─ Start/Stop│                                      │
-///   └──────────────┴──────────────────────────────────────┘
+/// Main application window. Entirely code-constructed.
+/// Features a modern, monolithic flat layout with premium spacing.
 /// </summary>
 public sealed class MainForm : Form
 {
-    // ── Backend services ──────────────────────────────────────────────────────
+    private bool _isShuttingDown = false;
+    
     private WhisperService?    _whisper;
+    private VRChatService?    _vrchat;
     private MicrophoneCapture? _mic;
     private CaptionServer?     _server;
     private bool               _running;
     private readonly System.Windows.Forms.Timer _peakTimer = new() { Interval = 50 };
-
-    // ── UI controls we need to reference after construction ───────────────────
+    
     private ComboBox        _modelCombo   = null!;
     private ComboBox        _micCombo     = null!;
     private ComboBox        _langCombo    = null!;
@@ -44,8 +35,9 @@ public sealed class MainForm : Form
     private Label           _urlLabel     = null!;
     private ProgressBar     _downloadBar  = null!;
     private Label           _downloadLabel = null!;
+    private NotifyIcon _trayIcon = null!;
 
-    // ── Known models ──────────────────────────────────────────────────────────
+
     private static readonly (string Label, string FileName, string Url)[] Models =
     [
         ("Tiny   (~75 MB)",   "ggml-tiny.bin",    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"),
@@ -60,28 +52,62 @@ public sealed class MainForm : Form
         BuildForm();
         PopulateMics();
         MarkDownloadedModels();
+        SetupTrayIcon();
         _peakTimer.Tick += (_, _) => _waveform.DecayPeak();
         _peakTimer.Start();
+
+        var serverPort = AppSettings.Instance.GetInt("Overlay.Port");
+        if (serverPort == 0)
+        {
+            serverPort = 5000;
+            AppSettings.Instance.Set("Overlay.Port", serverPort);
+        }
+        _server = new CaptionServer(serverPort);
+        _ = _server.StartAsync();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Form construction
-    // ─────────────────────────────────────────────────────────────────────────
+    private void SetupTrayIcon()
+    {
+        var menu = new ContextMenuStrip();
+        
+        var openItem = new ToolStripMenuItem("Open WhisperOBS");
+        openItem.Click += (_, _) => {
+            this.Show();
+            this.WindowState = FormWindowState.Normal;
+            this.Activate();
+        };
+        menu.Items.Add(openItem);
+        
+        menu.Items.Add(new ToolStripSeparator());
+        
+        var exitItem = new ToolStripMenuItem("Exit");
+        exitItem.Click += (_, _) => {
+            this.Close();
+        };
+        menu.Items.Add(exitItem);
+        
+        _trayIcon = new NotifyIcon
+        {
+            Icon = this.Icon,
+            Text = "WhisperOBS",
+            Visible = true,
+            ContextMenuStrip = menu
+        };
+    }
+    
 
     private void BuildForm()
     {
-        // ── Window chrome ─────────────────────────────────────────────────────
         Text            = "WhisperOBS";
-        Size            = new Size(1000, 680);
-        MinimumSize     = new Size(820, 560);
+        Size            = new Size(1040, 720);
+        MinimumSize     = new Size(860, 600);
         BackColor       = Theme.Background;
         ForeColor       = Theme.TextPrimary;
         Font            = Theme.FontBody;
         StartPosition   = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.Sizable;
         Icon            = BuildIcon();
-
-        // ── Root layout: header + body ────────────────────────────────────────
+        
         var root = new TableLayoutPanel
         {
             Dock        = DockStyle.Fill,
@@ -91,16 +117,14 @@ public sealed class MainForm : Form
             Padding     = Padding.Empty,
             Margin      = Padding.Empty,
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(root);
 
         root.Controls.Add(BuildHeader(), 0, 0);
         root.Controls.Add(BuildBody(),   0, 1);
     }
-
-    // ── Header ────────────────────────────────────────────────────────────────
-
+    
     private Panel BuildHeader()
     {
         var header = new Panel
@@ -110,53 +134,83 @@ public sealed class MainForm : Form
             Padding   = new Padding(Theme.PadLg, 0, Theme.PadLg, 0),
         };
 
-        // Left: logo
-        var logo = new Label
+        var grid = new TableLayoutPanel
         {
-            Text      = "WHISPER",
-            Font      = Theme.FontDisplay,
-            ForeColor = Theme.TextPrimary,
-            AutoSize  = true,
-            Dock      = DockStyle.Left,
-            TextAlign = ContentAlignment.MiddleLeft,
+            Dock            = DockStyle.Fill,
+            ColumnCount     = 2,
+            RowCount        = 1,
+            BackColor       = Color.Transparent,
+            Padding         = Padding.Empty,
+            Margin          = Padding.Empty
+        };
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        header.Controls.Add(grid);
+
+         var logoGroup = new Panel
+        {
+            Anchor    = AnchorStyles.Left | AnchorStyles.Right,
+            Height    = 32, 
+            BackColor = Color.Transparent,
+            Margin    = Padding.Empty
         };
 
-        var logoAccent = new Label
+        var brandLogo = new Label
         {
-            Text      = "OBS",
-            Font      = Theme.FontDisplay,
-            ForeColor = Theme.Accent,
-            AutoSize  = true,
-            Dock      = DockStyle.Left,
-            TextAlign = ContentAlignment.MiddleLeft,
+            Dock     = DockStyle.Fill,
+            Font     = Theme.FontDisplay,
+            AutoSize = false,
+            Margin   = Padding.Empty
         };
 
-        // Right: status pill
+        brandLogo.Paint += (sender, e) =>
+        {
+            var g = e.Graphics;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+            string part1 = "WHISPER";
+            string part2 = "OBS";
+
+            Size size1 = TextRenderer.MeasureText(g, part1, brandLogo.Font, Size.Empty, TextFormatFlags.NoPadding);
+
+            TextRenderer.DrawText(g, part1, brandLogo.Font, 
+                new Point(0, (brandLogo.Height - size1.Height) / 2), 
+                Theme.TextPrimary, 
+                TextFormatFlags.NoPadding);
+            
+            int part2X = size1.Width + 4; 
+            Size size2 = TextRenderer.MeasureText(g, part2, brandLogo.Font, Size.Empty, TextFormatFlags.NoPadding);
+
+            TextRenderer.DrawText(g, part2, brandLogo.Font, 
+                new Point(part2X, (brandLogo.Height - size2.Height) / 2), 
+                Theme.Accent, 
+                TextFormatFlags.NoPadding);
+        };
+
+        logoGroup.Controls.Add(brandLogo);
+        grid.Controls.Add(logoGroup, 0, 0);
+        
         _statusPill = new StatusPill
         {
             StatusText = "Idle",
             State      = StatusPill.PillState.Idle,
-            Dock       = DockStyle.Right,
-            Width      = 140,
+            Anchor     = AnchorStyles.Right, 
+            Width      = 120,
+            Height     = 28, 
+            Margin     = Padding.Empty
         };
-
-        header.Controls.Add(_statusPill);
-        header.Controls.Add(logoAccent);
-        header.Controls.Add(logo);
-
-        // Bottom border
-        var border = new Panel
+        grid.Controls.Add(_statusPill, 1, 0);
+        
+        header.Paint += (_, e) =>
         {
-            Height    = 1,
-            Dock      = DockStyle.Bottom,
-            BackColor = Theme.Border,
+            using var pen = new Pen(Theme.Border, 1f);
+            e.Graphics.DrawLine(pen, 0, header.Height - 1, header.Width, header.Height - 1);
         };
-        header.Controls.Add(border);
 
         return header;
     }
-
-    // ── Body: left sidebar + right content ───────────────────────────────────
+    
 
     private Control BuildBody()
     {
@@ -169,7 +223,7 @@ public sealed class MainForm : Form
             Padding     = Padding.Empty,
             Margin      = Padding.Empty,
         };
-        body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 280));
+        body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
         body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
         body.Controls.Add(BuildSidebar(), 0, 0);
@@ -177,123 +231,151 @@ public sealed class MainForm : Form
         return body;
     }
 
-    // ── Left sidebar ──────────────────────────────────────────────────────────
-
     private Control BuildSidebar()
+{
+    var sidebar = new Panel
     {
-        var sidebar = new Panel
-        {
-            Dock      = DockStyle.Fill,
-            BackColor = Theme.Surface,
-            Padding   = new Padding(Theme.PadMd),
-        };
+        Dock = DockStyle.Fill,
+        BackColor = Theme.Surface,
+        Padding = new Padding(Theme.PadLg, Theme.PadMd, Theme.PadLg, Theme.PadMd),
+    };
 
-        // Right border
-        sidebar.Paint += (_, e) =>
-        {
-            using var pen = new Pen(Theme.Border, 1);
-            e.Graphics.DrawLine(pen, sidebar.Width - 1, 0, sidebar.Width - 1, sidebar.Height);
-        };
+    sidebar.Paint += (_, e) => {
+        using var pen = new Pen(Theme.Border, 1f);
+        e.Graphics.DrawLine(pen, sidebar.Width - 1, 0, sidebar.Width - 1, sidebar.Height);
+    };
 
-        var flow = new FlowLayoutPanel
-        {
-            Dock          = DockStyle.Fill,
-            FlowDirection = FlowDirection.TopDown,
-            AutoScroll    = true,
-            WrapContents  = false,
-            BackColor     = Color.Transparent,
-            Padding       = Padding.Empty,
-        };
+    var scrollContainer = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent };
+    var contentStack = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 1, AutoSize = true };
+    contentStack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+    scrollContainer.Controls.Add(contentStack);
+    sidebar.Controls.Add(scrollContainer);
 
-        int inputW = 226;
+    void AddSettingBlock(string title, Control input, int bottomSpace = 24)
+    {
+        var header = Theme.MakeEyebrow(title);
+        header.Margin = new Padding(0, 16, 0, 4); 
+        
+        var separator = new Panel { Height = 1, BackColor = Theme.SurfaceAlt, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 8) };
 
-        // ── Model ─────────────────────────────────────────────────────────────
-        flow.Controls.Add(Theme.MakeEyebrow("Whisper Model"));
-        _modelCombo = new ComboBox { Width = inputW, DropDownStyle = ComboBoxStyle.DropDownList };
-        foreach (var (label, _, _) in Models) _modelCombo.Items.Add(label);
-        _modelCombo.SelectedIndex = 1; // default: Base
-        Theme.ApplyToCombo(_modelCombo);
-        flow.Controls.Add(_modelCombo);
-
-        _downloadBar = new ProgressBar
-        {
-            Width   = inputW,
-            Height  = 6,
-            Visible = false,
-            Style   = ProgressBarStyle.Continuous,
-            Margin  = new Padding(0, 4, 0, 0),
-        };
-        flow.Controls.Add(_downloadBar);
-
-        _downloadLabel = new Label
-        {
-            Text      = "",
-            Font      = Theme.FontMuted,
-            ForeColor = Theme.TextMuted,
-            Width     = inputW,
-            AutoSize  = false,
-            Height    = 16,
-            Visible   = false,
-        };
-        flow.Controls.Add(_downloadLabel);
-
-        // ── Microphone ────────────────────────────────────────────────────────
-        flow.Controls.Add(Spacer(8));
-        flow.Controls.Add(Theme.MakeEyebrow("Microphone"));
-        _micCombo = new ComboBox { Width = inputW, DropDownStyle = ComboBoxStyle.DropDownList };
-        Theme.ApplyToCombo(_micCombo);
-        flow.Controls.Add(_micCombo);
-
-        // ── Language ──────────────────────────────────────────────────────────
-        flow.Controls.Add(Spacer(8));
-        flow.Controls.Add(Theme.MakeEyebrow("Language"));
-        _langCombo = new ComboBox { Width = inputW, DropDownStyle = ComboBoxStyle.DropDownList };
-        Theme.ApplyToCombo(_langCombo);
-        foreach (var (code, name) in LanguageList())
-            _langCombo.Items.Add($"{code}  –  {name}");
-        _langCombo.SelectedIndex = 0; // auto-detect
-        flow.Controls.Add(_langCombo);
-
-        // ── Port ──────────────────────────────────────────────────────────────
-        flow.Controls.Add(Spacer(8));
-        flow.Controls.Add(Theme.MakeEyebrow("OBS Overlay Port"));
-        _portNum = ThemedInput.MakeNumeric(1024, 65535, 5000, inputW);
-        _portNum.ValueChanged += (_, _) => UpdateUrlLabel();
-        flow.Controls.Add(_portNum);
-
-        // ── Chunk duration ────────────────────────────────────────────────────
-        flow.Controls.Add(Spacer(4));
-        flow.Controls.Add(Theme.MakeLabel("Chunk duration (seconds)", muted: true));
-        _chunkNum = ThemedInput.MakeNumeric(1, 10, 3, inputW);
-        flow.Controls.Add(_chunkNum);
-
-        // ── Spacer push ───────────────────────────────────────────────────────
-        flow.Controls.Add(Spacer(20));
-
-        // ── Buttons ───────────────────────────────────────────────────────────
-        _startBtn = new ThemedButton("▶  Start Listening", ThemedButton.ButtonVariant.Primary)
-        {
-            Width  = inputW,
-            Height = 44,
-        };
-        _startBtn.Click += OnStartStop;
-        flow.Controls.Add(_startBtn);
-
-        flow.Controls.Add(Spacer(6));
-
-        _clearBtn = new ThemedButton("Clear Log", ThemedButton.ButtonVariant.Secondary)
-        {
-            Width  = inputW,
-            Height = 36,
-        };
-        _clearBtn.Click += (_, _) => _captionLog.Clear();
-        flow.Controls.Add(_clearBtn);
-
-        sidebar.Controls.Add(flow);
-        return sidebar;
+        contentStack.RowCount += 3;
+        contentStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        contentStack.RowStyles.Add(new RowStyle(SizeType.Absolute, 10f));
+        contentStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        
+        contentStack.Controls.Add(header, 0, contentStack.RowCount - 3);
+        contentStack.Controls.Add(separator, 0, contentStack.RowCount - 2);
+        
+        input.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+        input.Margin = new Padding(0, 0, 0, bottomSpace);
+        contentStack.Controls.Add(input, 0, contentStack.RowCount - 1);
     }
+    
+    void AddDirectly(Control control, int bottomSpace = 8)
+    {
+        control.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+        control.Margin = new Padding(0, 0, 0, bottomSpace);
+    
+        contentStack.RowCount++;
+        contentStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        contentStack.Controls.Add(control);
+    }
+    
+    _modelCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+    foreach (var (label, _, _) in Models) _modelCombo.Items.Add(label);
+    _modelCombo.SelectedIndex = 1;
+    Theme.ApplyToCombo(_modelCombo);
+    AddSettingBlock("Whisper Model", _modelCombo);
 
-    // ── Right content panel ───────────────────────────────────────────────────
+    _downloadBar = new ProgressBar
+    {
+        Width   = 90,
+        Height  = 6,
+        Visible = false,
+        Style   = ProgressBarStyle.Continuous,
+        Margin  = new Padding(0, 4, 0, 0),
+    };
+    AddDirectly(_downloadBar, bottomSpace: 2); // Tight spacing between bar and label
+    
+    _downloadLabel = new Label
+    {
+        Text      = "",
+        Font      = Theme.FontMuted,
+        ForeColor = Theme.TextMuted,
+        Width     = 90,
+        AutoSize  = false,
+        Height    = 16,
+        Visible   = false,
+    };
+    AddDirectly(_downloadLabel, bottomSpace: 28); // Standard gap after status
+    
+    _micCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+    Theme.ApplyToCombo(_micCombo);
+    AddSettingBlock("Microphone Input", _micCombo);
+    
+    _langCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+    Theme.ApplyToCombo(_langCombo);
+    foreach (var (code, name) in LanguageList()) _langCombo.Items.Add($"{code}  –  {name}");
+    _langCombo.SelectedIndex = 0;
+    AddSettingBlock("Transcription Language", _langCombo);
+
+    _portNum = ThemedInput.MakeNumeric(1024, 65535, 5000);
+    _portNum.ValueChanged += (_, _) => UpdateUrlLabel();
+    AddSettingBlock("Port", _portNum);
+
+    
+    _startBtn = new ThemedButton("▶  Start Listening", ThemedButton.ButtonVariant.Primary)
+    {
+        Height = 46,
+        Anchor = AnchorStyles.Left | AnchorStyles.Right,
+        Margin = Padding.Empty
+    };
+    _startBtn.Click += OnStartStop;
+
+    var settingsBtn = new ThemedButton("⚙  Settings", ThemedButton.ButtonVariant.Secondary)
+    {
+        Height = 36,
+        Anchor = AnchorStyles.Left | AnchorStyles.Right,
+        Margin = new Padding(0, 12, 0, 0)
+    };
+    settingsBtn.Click += (_, _) =>
+    {
+        using var diag = new SettingsDialog();
+        diag.ShowDialog(this);
+    };
+
+    _clearBtn = new ThemedButton("Clear Session Log", ThemedButton.ButtonVariant.Secondary)
+    {
+        Height = 36,
+        Anchor = AnchorStyles.Left | AnchorStyles.Right,
+        Margin = new Padding(0, 12, 0, 0) 
+    };
+    _clearBtn.Click += (_, _) => _captionLog.Clear();
+
+    var actionDeck = new TableLayoutPanel
+    {
+        Dock            = DockStyle.Bottom,
+        ColumnCount     = 1,
+        RowCount        = 3, 
+        Height          = 46 + 12 + 36 + 12 + 36, 
+        BackColor       = Color.Transparent,
+        Padding         = Padding.Empty,
+        Margin          = Padding.Empty
+    };
+    actionDeck.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+    actionDeck.RowStyles.Add(new RowStyle(SizeType.Absolute, 46f));
+    actionDeck.RowStyles.Add(new RowStyle(SizeType.Absolute, 48f)); 
+    actionDeck.RowStyles.Add(new RowStyle(SizeType.Absolute, 48f));
+    
+    actionDeck.Controls.Add(_startBtn, 0, 0);
+    actionDeck.Controls.Add(settingsBtn, 0, 1); 
+    actionDeck.Controls.Add(_clearBtn, 0, 2); 
+    sidebar.Controls.Add(actionDeck);
+    
+    return sidebar;
+}
+
+    
 
     private Control BuildContent()
     {
@@ -303,49 +385,77 @@ public sealed class MainForm : Form
             RowCount    = 3,
             ColumnCount = 1,
             BackColor   = Theme.Background,
-            Padding     = new Padding(Theme.PadLg, Theme.PadMd, Theme.PadLg, Theme.PadMd),
+            Padding     = new Padding(Theme.PadLg, Theme.PadLg, Theme.PadLg, Theme.PadLg),
         };
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));   // waveform
-        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // caption log
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));   // URL bar
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 90));   
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));   
 
-        // ── Waveform ──────────────────────────────────────────────────────────
         _waveform = new WaveformVisualizer
         {
             Dock   = DockStyle.Fill,
-            Margin = new Padding(0, 0, 0, Theme.PadSm),
+            Margin = new Padding(0, 0, 0, Theme.PadMd),
         };
         panel.Controls.Add(_waveform, 0, 0);
 
-        // ── Caption log ───────────────────────────────────────────────────────
+        var visualizerClock = new System.Windows.Forms.Timer
+        {
+            Interval = 30 
+        };
+        visualizerClock.Tick += (s, e) =>
+        {
+            if (_waveform is { IsDisposed: false, Visible: true })
+            {
+                _waveform.DecayPeak();
+            }
+        };
+        
+        panel.Disposed += (s, e) => {
+            visualizerClock.Stop();
+            visualizerClock.Dispose();
+        };
+
+        visualizerClock.Start();
+
         var logCard = new Panel
         {
             Dock      = DockStyle.Fill,
-            BackColor = Theme.SurfaceAlt,
-            Padding   = Padding.Empty,
-            Margin    = new Padding(0, 0, 0, Theme.PadSm),
+            BackColor = Theme.Surface,
+            Margin    = new Padding(0, 0, 0, Theme.PadMd),
         };
 
         var logHeader = new Panel
         {
             Dock      = DockStyle.Top,
-            Height    = 30,
+            Height    = 36,
             BackColor = Theme.Surface,
-            Padding   = new Padding(Theme.PadSm, 0, Theme.PadSm, 0),
+            Padding   = new Padding(Theme.PadMd, 0, Theme.PadMd, 0),
         };
-        var logTitle = Theme.MakeLabel("CAPTION HISTORY");
-        logTitle.ForeColor = Theme.Accent;
-        logTitle.Font      = Theme.FontLabel;
+
+        var logTitle = Theme.MakeEyebrow("Live Transcription Logs");
         logTitle.Dock      = DockStyle.Left;
         logTitle.TextAlign = ContentAlignment.MiddleLeft;
+        logTitle.AutoSize  = false; 
+        logTitle.Width     = 250; 
         logHeader.Controls.Add(logTitle);
 
-        _captionLog = new CaptionLog { Dock = DockStyle.Fill };
+        logHeader.Paint += (_, e) => {
+            using var pen = new Pen(Theme.Border, 1f);
+            e.Graphics.DrawLine(pen, 0, logHeader.Height - 1, logHeader.Width, logHeader.Height - 1);
+        };
+
+        _captionLog = new CaptionLog 
+        { 
+            Dock = DockStyle.Fill,
+            Padding = new Padding(Theme.PadSm)
+        };
+
         logCard.Controls.Add(_captionLog);
         logCard.Controls.Add(logHeader);
-        panel.Controls.Add(logCard, 0, 1);
 
-        // ── OBS URL bar ───────────────────────────────────────────────────────
+        panel.Controls.Add(logCard, 0, 1);
+        
+
         var urlBar = new Panel
         {
             Dock      = DockStyle.Fill,
@@ -355,11 +465,11 @@ public sealed class MainForm : Form
 
         var urlEyebrow = new Label
         {
-            Text      = "OBS BROWSER SOURCE URL",
+            Text      = "OBS BROWSER SOURCE CONNECT URL:",
             Font      = Theme.FontLabel,
-            ForeColor = Theme.Accent,
+            ForeColor = Theme.TextMuted,
             Dock      = DockStyle.Left,
-            Width     = 200,
+            Width     = 240,
             TextAlign = ContentAlignment.MiddleLeft,
         };
 
@@ -368,41 +478,45 @@ public sealed class MainForm : Form
             Text      = $"http://localhost:{_portNum?.Value ?? 5000}",
             Font      = Theme.FontMonoLarge,
             ForeColor = Theme.TextPrimary,
-            Dock      = DockStyle.Left,
-            AutoSize  = true,
+            Dock      = DockStyle.Fill, 
             TextAlign = ContentAlignment.MiddleLeft,
             Cursor    = Cursors.Hand,
         };
-        _urlLabel.Click += (_, _) =>
-        {
+        
+
+        var copyAction = new Action(() => {
             Clipboard.SetText(_urlLabel.Text);
-            _captionLog.AppendSystem("URL copied to clipboard.");
-        };
+            _captionLog.AppendSystem("Connection link copied to clipboard infrastructure safely.");
+        });
+
+        _urlLabel.Click += (_, _) => copyAction();
 
         var copyBtn = new ThemedButton("Copy URL", ThemedButton.ButtonVariant.Secondary)
         {
-            Width  = 90,
-            Height = 30,
-            Dock   = DockStyle.Right,
-            Margin = new Padding(0, 7, 0, 7),
+            Width  = 100,
+            Height = 32,
+            Anchor = AnchorStyles.Right,
+            Location = new Point(urlBar.Width - 100 - Theme.PadMd, (urlBar.Height - 32) / 2)
         };
-        copyBtn.Click += (_, _) =>
-        {
-            Clipboard.SetText(_urlLabel.Text);
-            _captionLog.AppendSystem("URL copied to clipboard.");
+        copyBtn.Click += (_, _) => copyAction();
+
+        urlBar.Resize += (_, _) => {
+            copyBtn.Location = new Point(urlBar.Width - copyBtn.Width - urlBar.Padding.Right, (urlBar.Height - copyBtn.Height) / 2);
         };
 
-        urlBar.Controls.Add(copyBtn);
-        urlBar.Controls.Add(_urlLabel);
-        urlBar.Controls.Add(urlEyebrow);
+        urlBar.Paint += (_, e) => {
+            using var pen = new Pen(Theme.Border, 1f);
+            e.Graphics.DrawRectangle(pen, 0, 0, urlBar.Width - 1, urlBar.Height - 1);
+        };
+
+        urlBar.Controls.Add(_urlLabel);   
+        urlBar.Controls.Add(urlEyebrow);  
+        urlBar.Controls.Add(copyBtn);     
         panel.Controls.Add(urlBar, 0, 2);
 
         return panel;
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Logic
-    // ─────────────────────────────────────────────────────────────────────────
+    
 
     private async void OnStartStop(object? sender, EventArgs e)
     {
@@ -412,7 +526,6 @@ public sealed class MainForm : Form
 
     private async Task StartAsync()
     {
-        // Disable settings while loading; start button stays enabled so user can cancel
         SetSettingsEnabled(false);
         _startBtn.Enabled      = false;
         _statusPill.State      = StatusPill.PillState.Loading;
@@ -420,7 +533,6 @@ public sealed class MainForm : Form
 
         try
         {
-            // ── Resolve model path (download if needed) ───────────────────────
             int modelIdx = _modelCombo.SelectedIndex;
             var (_, fileName, url) = Models[modelIdx];
             string modelsDir  = Path.Combine(AppContext.BaseDirectory, "models");
@@ -429,7 +541,7 @@ public sealed class MainForm : Form
 
             if (!File.Exists(modelPath))
             {
-                _captionLog.AppendSystem($"Downloading {fileName}…");
+                _captionLog.AppendSystem($"Downloading system resource model: {fileName}…");
                 _downloadBar.Visible   = true;
                 _downloadLabel.Visible = true;
                 _downloadBar.Value     = 0;
@@ -439,60 +551,136 @@ public sealed class MainForm : Form
                 _downloadBar.Visible   = false;
                 _downloadLabel.Visible = false;
                 _downloadLabel.Text    = "";
-                _captionLog.AppendSystem("Download complete.");
+                _captionLog.AppendSystem("Download operation finished.");
             }
 
-            // ── Load Whisper ──────────────────────────────────────────────────
-            _captionLog.AppendSystem("Loading Whisper model…");
+            _captionLog.AppendSystem("Initializing model dependencies…");
             string langCode = _langCombo.SelectedIndex == 0 ? "auto"
                 : _langCombo.Text.Split("  –  ")[0].Trim();
 
             _whisper = new WhisperService(modelPath, langCode);
             await _whisper.InitAsync();
-            _captionLog.AppendSystem("Model ready.");
+            _captionLog.AppendSystem("Engine starting Whisper service.");
 
-            // ── Start HTTP/WS server ──────────────────────────────────────────
+            var isVRChatEnabled = AppSettings.Instance.GetBool("VRChat.Enabled");
+            if (isVRChatEnabled)
+            {
+                _vrchat = new VRChatService();
+                _captionLog.AppendSystem("Engine starting VRChat service.");
+            }
+            
+            _captionLog.AppendSystem("Engine status: online.");
+            
             int port = (int)_portNum.Value;
-            _server  = new CaptionServer(port);
-            _ = _server.StartAsync();
-            _captionLog.AppendSystem($"OBS overlay server started on port {port}.");
 
-            // ── Start mic capture ─────────────────────────────────────────────
-            int micIdx = _micCombo.SelectedIndex;
-            _mic       = new MicrophoneCapture(micIdx)
+            if (_server is null)
             {
-                ChunkSeconds = (double)_chunkNum.Value
-            };
-
-            _mic.AudioReady += async (samples) =>
+                _server  = new CaptionServer(port);    
+            }
+            else
             {
-                float rms = ComputeRms(samples);
-                Invoke(() => _waveform.Push(rms * 3.5f));
-
-                var text = await _whisper!.TranscribeAsync(samples);
-                if (!string.IsNullOrWhiteSpace(text))
+                if (port != _server.GetPort())
                 {
-                    Invoke(() => _captionLog.AppendCaption(text));
-                    await _server!.BroadcastAsync(text);
+                    _server  = new CaptionServer(port);   
+                    _ = _server.StartAsync();
                 }
+            }
+            
+            
+            _captionLog.AppendSystem($"Local networking active on port: {port}.");
+
+            if (_micCombo == null) return;
+            
+            int micIdx = _micCombo.SelectedIndex;
+            if (micIdx < 0) 
+            {
+                MessageBox.Show("Please select a microphone first.");
+                return;
+            }
+            
+            try 
+            {
+                _mic = new MicrophoneCapture(micIdx)
+                {
+                    ChunkSeconds = (double)(_chunkNum?.Value ?? (decimal)3.0)
+                };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Microphone init failed: {ex.Message}");
+            }
+
+            if (_mic == null)
+            {
+                _statusPill.State      = StatusPill.PillState.Error;
+                _statusPill.StatusText = "Error";
+                _captionLog.AppendSystem($"Start failed: Couldn't start microphone capture.");
+                await StopAsync();
+                return;
+            }
+            
+            _mic.LiveBufferAvailable += (samples) =>
+            {
+                if (_isShuttingDown) return;
+                if (this.IsDisposed || this.Disposing) return;
+
+                float rms = ComputeRms(samples);
+    
+                this.BeginInvoke(new Action(() => 
+                {
+                    if (!this.IsDisposed) 
+                    {
+                        _waveform?.Push(rms * 20.0f);
+                    }
+                }));
+            };
+            
+            _mic.AudioReady += (samples) =>
+            {
+                if (_isShuttingDown) return Task.CompletedTask;
+                
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var text = await _whisper!.TranscribeAsync(samples);
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            var isProfanityFilterOn = AppSettings.Instance.GetBool("Engine.Profanity");
+                            var filteredText = isProfanityFilterOn ? CensorSettingsView.FilterText(text) : text;
+
+                            if (!string.IsNullOrWhiteSpace(filteredText))
+                            {
+                                Invoke(() => _captionLog.AppendCaption(filteredText));
+                                await _server!.SendCaptionAsync(filteredText);
+                                await _vrchat!.SendCaptionAsync(filteredText);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Invoke(() => _captionLog.AppendSystem($"Transcription error: {ex.Message}"));
+                    }
+                });
+                
+                return Task.CompletedTask;
             };
 
             _mic.Start();
 
             _running               = true;
-            _startBtn.Text         = "■  Stop";
+            _startBtn.Text         = "■  Stop Capture Engine";
             _startBtn.Variant      = ThemedButton.ButtonVariant.Danger;
             _startBtn.Enabled      = true;
             _statusPill.State      = StatusPill.PillState.Running;
             _statusPill.StatusText = "Listening";
-            _captionLog.AppendSystem("Listening…");
+            _captionLog.AppendSystem("Stream pipeline captured cleanly.");
         }
         catch (Exception ex)
         {
             _statusPill.State      = StatusPill.PillState.Error;
             _statusPill.StatusText = "Error";
-            _captionLog.AppendSystem($"Error: {ex.Message}");
-            // StopAsync re-enables settings, so call it on error too
+            _captionLog.AppendSystem($"Pipeline crash detailing: {ex.Message}");
             await StopAsync();
         }
     }
@@ -505,8 +693,7 @@ public sealed class MainForm : Form
 
         _whisper?.Dispose();
         _whisper = null;
-
-        _server = null;
+        
 
         _running               = false;
         _startBtn.Text         = "▶  Start Listening";
@@ -514,28 +701,21 @@ public sealed class MainForm : Form
         _startBtn.Enabled      = true;
         _statusPill.State      = StatusPill.PillState.Idle;
         _statusPill.StatusText = "Idle";
-        _captionLog.AppendSystem("Stopped.");
+        _captionLog.AppendSystem("Pipeline session closed cleanly.");
 
-        // Re-enable all settings controls now that we're stopped
         SetSettingsEnabled(true);
-
         await Task.CompletedTask;
     }
 
-    /// <summary>Enable or disable only the settings controls (not the start/stop button).</summary>
     private void SetSettingsEnabled(bool enabled)
     {
-        _modelCombo.Enabled = enabled;
-        _micCombo.Enabled   = enabled;
-        _langCombo.Enabled  = enabled;
-        _portNum.Enabled    = enabled;
-        _chunkNum.Enabled   = enabled;
+        _modelCombo?.Invoke(new Action(() => _modelCombo.Enabled = enabled));
+        _micCombo?.Invoke(new Action(() => _micCombo.Enabled = enabled));
+        _langCombo?.Invoke(new Action(() => _langCombo.Enabled = enabled));
+        _portNum?.Invoke(new Action(() => _portNum.Enabled = enabled));
+        _chunkNum?.Invoke(new Action(() => _chunkNum.Enabled = enabled));
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Helpers
-    // ─────────────────────────────────────────────────────────────────────────
-
+    
     private void PopulateMics()
     {
         _micCombo.Items.Clear();
@@ -586,10 +766,14 @@ public sealed class MainForm : Form
             if (total.HasValue)
             {
                 int pct = (int)(downloaded * 100 / total.Value);
+    
                 Invoke(() =>
                 {
-                    _downloadBar.Value   = pct;
-                    _downloadLabel.Text  = $"{downloaded / 1_048_576} MB / {total.Value / 1_048_576} MB";
+                    if (!_downloadBar.IsDisposed && _downloadBar.IsHandleCreated && !_isShuttingDown)
+                    {
+                        _downloadBar.Value = Math.Clamp(pct, _downloadBar.Minimum, _downloadBar.Maximum);
+                        _downloadLabel.Text = $"{downloaded / 1_048_576} MB / {total.Value / 1_048_576} MB";
+                    }
                 });
             }
         }
@@ -609,23 +793,22 @@ public sealed class MainForm : Form
     {
         Height    = height,
         BackColor = Color.Transparent,
+        Tag       = "Spacer"
     };
 
     private static Icon BuildIcon()
     {
-        // Programmatically build a small icon: red circle on dark bg
         var bmp = new Bitmap(32, 32);
         using (var g = Graphics.FromImage(bmp))
         {
-            g.Clear(Color.FromArgb(0x1A, 0x1A, 0x2E));
+            g.Clear(Theme.Background);
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using var brush = new SolidBrush(Color.FromArgb(0xE9, 0x45, 0x60));
-            g.FillEllipse(brush, 4, 4, 24, 24);
+            using var brush = new SolidBrush(Theme.Accent);
+            g.FillEllipse(brush, 6, 6, 20, 20);
         }
         return Icon.FromHandle(bmp.GetHicon());
     }
 
-    // ── Language list ─────────────────────────────────────────────────────────
     private static (string code, string name)[] LanguageList() =>
     [
         ("auto", "Auto-detect"),
@@ -649,13 +832,60 @@ public sealed class MainForm : Form
         ("nb",   "Norwegian"),
         ("da",   "Danish"),
     ];
-
-    protected override void OnFormClosed(FormClosedEventArgs e)
+    
+    protected override void OnResize(EventArgs e)
     {
-        _mic?.Stop();
-        _mic?.Dispose();
-        _whisper?.Dispose();
-        _peakTimer.Dispose();
-        base.OnFormClosed(e);
+        base.OnResize(e);
+
+        bool minimizeToTray = AppSettings.Instance.GetBool("UI.MinimizeToTray");
+        if (minimizeToTray && this.WindowState == FormWindowState.Minimized)
+        {
+            this.Hide();
+            _trayIcon.Visible = true;
+        }
     }
+
+    protected override async void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (_isShuttingDown)
+        {
+            base.OnFormClosing(e);
+            return;
+        }
+
+        e.Cancel = true;
+        _isShuttingDown = true;
+    
+        if (_downloadBar != null && !_downloadBar.IsDisposed)
+        {
+            _downloadBar.Visible = false;
+        }
+        
+        this.Enabled = false; 
+
+        try 
+        {
+            await StopAsync();
+        
+            
+            _server?.Dispose();
+            _server = null;
+            
+            _mic?.Stop();
+            _mic?.Dispose();
+            _whisper?.Dispose();
+            _vrchat?.Dispose();
+            _peakTimer?.Dispose();
+            _downloadBar?.Dispose();
+            _downloadLabel?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Cleanup error: {ex.Message}");
+        }
+
+        this.Close();
+    }
+    
+    
 }

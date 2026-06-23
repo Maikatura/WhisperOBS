@@ -27,8 +27,7 @@ internal sealed class CaptionLog : Control
         };
         _scroll.Scroll += (_, _) => Invalidate();
         Controls.Add(_scroll);
-
-        // Mouse wheel
+        
         MouseWheel += (_, e) =>
         {
             int delta = -(e.Delta / 120) * 3;
@@ -52,8 +51,7 @@ internal sealed class CaptionLog : Control
         int totalLines   = _entries.Count;
         _scroll.Maximum  = Math.Max(0, totalLines - 1);
         _scroll.LargeChange = visibleLines;
-
-        // Auto-scroll to bottom
+        
         _scroll.Value = Math.Max(0, _scroll.Maximum - visibleLines + 1);
         Invalidate();
     }
@@ -87,19 +85,17 @@ internal sealed class CaptionLog : Control
             var entry = _entries[idx];
             int y     = i * LineH;
 
-            // Zebra row
+    
             if (idx % 2 == 0)
             {
                 using var rowBrush = new SolidBrush(Color.FromArgb(15, 255, 255, 255));
                 g.FillRectangle(rowBrush, 0, y, Width - scrollW, LineH);
             }
 
-            // Timestamp
             string ts = entry.Time.ToString("HH:mm:ss");
             using var tsBrush = new SolidBrush(Theme.TextMuted);
             g.DrawString(ts, Theme.FontMuted, tsBrush, Theme.PadSm, y + (LineH - Theme.FontMuted.Height) / 2f);
-
-            // Caption text
+            
             int textX = Theme.PadSm + 58;
             Color textColor = entry.IsSystem ? Theme.TextMuted : Theme.TextCaption;
             using var textBrush = new SolidBrush(textColor);
@@ -108,8 +104,7 @@ internal sealed class CaptionLog : Control
                 new RectangleF(textX, y + 2, drawWidth - textX + Theme.PadSm, LineH),
                 new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap });
         }
-
-        // Empty state
+        
         if (_entries.Count == 0)
         {
             using var emptyBrush = new SolidBrush(Theme.TextMuted);
