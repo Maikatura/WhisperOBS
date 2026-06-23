@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net8.0-windows</TargetFramework>
+        <UseWindowsForms>true</UseWindowsForms>
+        <RootNamespace>WhisperOBS</RootNamespace>
+        <AssemblyName>WhisperOBS</AssemblyName>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <ApplicationIcon></ApplicationIcon>
+        <!-- Keep wwwroot next to the exe -->
+        <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Whisper.net"         Version="1.7.3" />
+        <PackageReference Include="Whisper.net.Runtime" Version="1.7.3" />
+        <PackageReference Include="NAudio"              Version="2.2.1" />
+    </ItemGroup>
+
+</Project>
